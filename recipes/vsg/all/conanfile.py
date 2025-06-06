@@ -20,13 +20,20 @@ class VsgConan(ConanFile):
     settings = "os", "arch", "compiler", "build_type"
     options = {
         "shared": [True, False],
-        "max_devices": [1,2,3,4],
         "fPIC": [True, False],
+        "max_devices": [1,2,3,4],
+        "windowing": [True, False],
+        "with_glslang": [True, False],
+        "max_instrumentation_level": [0,1,2,3],
     }
+
     default_options = {
         "shared": False,
-        "max_devices" : 1,
         "fPIC": True,
+        "max_devices" : 1,
+        "windowing" : True,
+        "with_glslang" : True,
+        "max_instrumentation_level": 1,
     }
 
     @property
@@ -49,7 +56,25 @@ class VsgConan(ConanFile):
             self.options.rm_safe("fPIC")
 
     def requirements(self):
-        self.requires("vulkan-loader/1.3.239.0", transitive_headers=True)
+        if Version(self.version) < "1.1.10":
+            # Use the older Vulkan loader version that matches previously released VSG binaries.
+            # Avoid bumping dependencies for older VSG versions to prevent cache breakage on remotes.
+            self.requires("vulkan-loader/1.3.239.0", transitive_headers=True)
+
+            # with_glslang requires min 1.3.243.0 (in vulkansdk scale), thus, removed in order
+            # to align with vulkan-loader version. (see generate() for detailed info)
+            del self.info.options.with_glslang
+            del self.info.options.max_instrumentation_level
+        else:
+            self.requires("vulkan-loader/1.3.268.0", transitive_headers=True)
+            if self.options.with_glslang:
+                self.requires("glslang/1.3.268.0", transitive_headers=True)
+                # Required to avoid missing include:
+                # It seems VSG relies on spirv headers that are propagated via
+                # glslang components, but conan glslang does not provide
+                # proper directory linkage to consumers. thus, its explicitly added.
+                self.requires("spirv-tools/1.3.268.0", transitive_headers=True)  
+
 
     def validate(self):
         if self.info.settings.compiler.cppstd:
@@ -74,8 +99,32 @@ class VsgConan(ConanFile):
         if is_msvc(self):
             tc.variables["USE_MSVC_RUNTIME_LIBRARY_DLL"] = False
         tc.variables["BUILD_SHARED_LIBS"] = self.options.shared
-        tc.variables["VSG_SUPPORTS_ShaderCompiler"] = 0
+        tc.variables["VSG_SUPPORTS_ShaderCompiler"] = 1 if self.options.with_glslang else 0
         tc.variables["VSG_MAX_DEVICES"] = self.options.max_devices
+        tc.variables["VSG_SUPPORTS_Windowing"] = 1 if self.options.windowing else 0
+
+        # Override GLSLANG_MIN_VERSION to ensure compatibility with the Conan-provided glslang.
+        #
+        # VSG sets GLSLANG_MIN_VERSION to "14" by default, based on glslang's internal versioning.
+        # However, the glslang package in Conan Center follows Vulkan SDK versioning instead.
+        #
+        # Only glslang >= 1.3.243.0 (Vulkan SDK version) in Conan exports the 
+        # `glslang-default-resource-limits` CMake target required by VSG.
+        #
+        # Without this override, VSG's call to:
+        #     find_package(glslang ${GLSLANG_MIN_VERSION} CONFIG)
+        # will fail, because no Conan-provided glslang package matches the default version "14".
+        #
+        # Note: GLSLANG_MIN_VERSION **must** be explicitly set. Leaving it at its default will 
+        # cause `find_package` to fail. While patching the VSG CMakeLists is an option, overriding
+        # the variable here is the cleanest and most maintainable solution.
+        tc.variables["GLSLANG_MIN_VERSION"] = "1.3.243.0"
+
+
+        if Version(self.version) >= "1.1.10":
+            tc.variables["VSG_MAX_INSTRUMENTATION_LEVEL"] = self.options.max_instrumentation_level
+
+            
         tc.generate()
 
         deps = CMakeDeps(self)
